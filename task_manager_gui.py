@@ -352,31 +352,40 @@ class DataFetcher(QObject):
                 processes = []
                 for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'username']):
                     try:
-                        pinfo = proc.as_dict(attrs=['pid', 'name', 'memory_info', 'username'])
-                        memory_mb = pinfo['memory_info'].rss / (1024**2)
-                        
-                        # Get CPU usage (non-blocking, returns 0.0 on first call)
-                        cpu_percent = 0.0
-                        try:
-                            cpu_percent = proc.cpu_percent(interval=0)
-                        except (psutil.AccessDenied, psutil.NoSuchProcess):
+                        # Use oneshot() for better performance on Windows
+                        with proc.oneshot():
+                            pinfo = proc.as_dict(attrs=['pid', 'name', 'memory_info', 'username'])
+                            memory_mb = pinfo['memory_info'].rss / (1024**2)
+                            
+                            # Get CPU usage (non-blocking, returns 0.0 on first call)
                             cpu_percent = 0.0
-                        
-                        disk_mb = 0.0
-                        try:
-                            io_counters = proc.io_counters()
-                            disk_mb = (io_counters.read_bytes + io_counters.write_bytes) / (1024**2)
-                        except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
+                            try:
+                                cpu_percent = proc.cpu_percent(interval=0)
+                            except (psutil.AccessDenied, psutil.NoSuchProcess):
+                                cpu_percent = 0.0
+                            
+                            # Get disk I/O (Windows may not always have access)
                             disk_mb = 0.0
-                        processes.append({
-                            'pid': pinfo['pid'],
-                            'name': pinfo['name'][:50],
-                            'username': pinfo.get('username') or 'unknown',
-                            'cpu_percent': cpu_percent,
-                            'memory_mb': memory_mb,
-                            'memory_percent': proc.memory_percent(),
-                            'disk_io_mb': disk_mb
-                        })
+                            try:
+                                io_counters = proc.io_counters()
+                                disk_mb = (io_counters.read_bytes + io_counters.write_bytes) / (1024**2)
+                            except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
+                                disk_mb = 0.0
+                            
+                            # Handle username - Windows may return None or DOMAIN\User format
+                            username = pinfo.get('username') or 'unknown'
+                            if username and '\\' in username:
+                                username = username.split('\\')[-1]  # Get username part only
+                            
+                            processes.append({
+                                'pid': pinfo['pid'],
+                                'name': pinfo['name'][:50],
+                                'username': username,
+                                'cpu_percent': cpu_percent,
+                                'memory_mb': memory_mb,
+                                'memory_percent': proc.memory_percent(),
+                                'disk_io_mb': disk_mb
+                            })
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                         pass
                 
@@ -1914,7 +1923,8 @@ class TaskManagerGUI(QMainWindow):
             
             # Cross-platform directory opening
             if os.name == 'nt':  # Windows
-                subprocess.Popen(['explorer', '/select,', exe_path])
+                # Use start command with /B to avoid new window, handle paths with spaces
+                subprocess.Popen(f'explorer /select,"{exe_path}"', shell=True)
             elif sys.platform == 'darwin':  # macOS
                 subprocess.Popen(['open', '-R', exe_path])
             else:  # Linux
@@ -1960,7 +1970,7 @@ class TaskManagerGUI(QMainWindow):
                 
                 # Cross-platform directory opening
                 if os.name == 'nt':  # Windows
-                    subprocess.Popen(['explorer', '/select,', exe_path])
+                    subprocess.Popen(f'explorer /select,"{exe_path}"', shell=True)
                 elif sys.platform == 'darwin':  # macOS
                     subprocess.Popen(['open', '-R', exe_path])
                 else:  # Linux
