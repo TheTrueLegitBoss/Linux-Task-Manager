@@ -14,6 +14,7 @@ import shutil
 import ctypes
 import webbrowser
 import urllib.parse
+import time
 try:
     import pygame
     GAMEPAD_AVAILABLE = True
@@ -27,7 +28,8 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject, QPoint, QRect, QEvent, QUrl
 from PyQt5.QtGui import QFont, QColor, QBrush, QKeyEvent
 try:
-    from PyQt5.QtWebEngineWidgets import QWebEngineView
+    from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
+    from PyQt5.QtWebEngineCore import QWebEngineUrlRequestInterceptor
     WEBENGINE_AVAILABLE = True
 except ImportError:
     WEBENGINE_AVAILABLE = False
@@ -220,8 +222,20 @@ def detect_gpu_info():
 
 def detect_cpu_name():
     """Detect the installed CPU model name."""
+    # Windows: Read from registry
+    if os.name == 'nt':
+        try:
+            import winreg
+            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
+            cpu_name = winreg.QueryValueEx(key, "ProcessorNameString")[0]
+            winreg.CloseKey(key)
+            return cpu_name.strip()
+        except Exception:
+            pass
+    
+    # Linux: Read from /proc/cpuinfo
     try:
-        if os.name != 'nt' and os.path.exists('/proc/cpuinfo'):
+        if os.path.exists('/proc/cpuinfo'):
             with open('/proc/cpuinfo', 'r') as f:
                 for line in f:
                     if 'model name' in line:
@@ -229,10 +243,11 @@ def detect_cpu_name():
     except Exception:
         pass
 
+    # Fallback to platform module
     try:
         import platform
         name = platform.processor() or platform.machine()
-        if name:
+        if name and name not in ['GenuineIntel', 'AuthenticAMD']:
             return name
     except Exception:
         pass
@@ -245,6 +260,36 @@ def detect_os_name():
     try:
         import platform
         system = platform.system() or 'Unknown OS'
+        
+        # For Linux, try to get the distribution name
+        if system == 'Linux':
+            try:
+                # Try freedesktop.org standard
+                if os.path.exists('/etc/os-release'):
+                    with open('/etc/os-release', 'r') as f:
+                        for line in f:
+                            if line.startswith('PRETTY_NAME='):
+                                distro_name = line.split('=', 1)[1].strip().strip('"')
+                                return distro_name
+                
+                # Fallback to platform.freedesktop_os_release (Python 3.10+)
+                try:
+                    import platform
+                    if hasattr(platform, 'freedesktop_os_release'):
+                        os_info = platform.freedesktop_os_release()
+                        return os_info.get('PRETTY_NAME', os_info.get('NAME', 'Linux'))
+                except:
+                    pass
+            except Exception:
+                pass
+            
+            # If we couldn't get distro name, show Linux with kernel version
+            release = platform.release() or ''
+            if release:
+                return f"Linux {release}"
+            return "Linux"
+        
+        # For other systems (Windows, macOS, etc.)
         release = platform.release() or ''
         if release:
             return f"{system} {release}"
@@ -331,11 +376,13 @@ def save_hide_inaccessible_processes(hide_inaccessible: bool):
 
 class DataFetcher(QObject):
     """Worker thread to fetch system data without blocking UI"""
+    __slots__ = ['process_cache', 'total_memory']
     data_ready = pyqtSignal(dict, list)
     
     def __init__(self):
         super().__init__()
         self.process_cache = {}
+        self.total_memory = psutil.virtual_memory().total  # Cache total memory
     
     def fetch_data(self):
         """Fetch memory and process data in background thread"""
@@ -343,54 +390,69 @@ class DataFetcher(QObject):
             try:
                 mem = psutil.virtual_memory()
                 mem_info = {
-                    'total': mem.total / (1024**3),
-                    'used': mem.used / (1024**3),
-                    'available': mem.available / (1024**3),
-                    'percent': mem.percent
+                    'total': round(mem.total / (1024**3), 2),
+                    'used': round(mem.used / (1024**3), 2),
+                    'available': round(mem.available / (1024**3), 2),
+                    'percent': round(mem.percent, 1)
                 }
                 
                 processes = []
                 for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'username']):
                     try:
-                        # Use oneshot() for better performance on Windows
+                            # Use oneshot() for better performance on Windows
                         with proc.oneshot():
+                            pid = proc.pid
                             pinfo = proc.as_dict(attrs=['pid', 'name', 'memory_info', 'username'])
-                            memory_mb = pinfo['memory_info'].rss / (1024**2)
-                            
-                            # Get CPU usage (non-blocking, returns 0.0 on first call)
+                            rss = pinfo['memory_info'].rss
+                            memory_mb = round(rss / 1048576, 1)  # Pre-calculated divisor
+                            # Get CPU usage with caching for efficiency
                             cpu_percent = 0.0
                             try:
-                                cpu_percent = proc.cpu_percent(interval=0)
+                                # Use cached value if available, otherwise calculate
+                                if pid in self.process_cache:
+                                    cpu_percent = proc.cpu_percent(interval=0)
+                                else:
+                                    # First call for this process - initialize
+                                    proc.cpu_percent(interval=0)
+                                    self.process_cache[pid] = True
+                                    cpu_percent = 0.0
                             except (psutil.AccessDenied, psutil.NoSuchProcess):
                                 cpu_percent = 0.0
                             
-                            # Get disk I/O (Windows may not always have access)
+                            # Get disk I/O - simplified calculation
                             disk_mb = 0.0
                             try:
-                                io_counters = proc.io_counters()
-                                disk_mb = (io_counters.read_bytes + io_counters.write_bytes) / (1024**2)
+                                io = proc.io_counters()
+                                disk_mb = round((io.read_bytes + io.write_bytes) / 1048576, 1)
                             except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
-                                disk_mb = 0.0
+                                pass
                             
                             # Handle username - Windows may return None or DOMAIN\User format
                             username = pinfo.get('username') or 'unknown'
-                            if username and '\\' in username:
-                                username = username.split('\\')[-1]  # Get username part only
+                            if '\\' in username:
+                                username = username.rpartition('\\')[2]  # Faster than split
                             
                             processes.append({
                                 'pid': pinfo['pid'],
-                                'name': pinfo['name'][:50],
-                                'username': username,
-                                'cpu_percent': cpu_percent,
-                                'memory_mb': memory_mb,
-                                'memory_percent': proc.memory_percent(),
-                                'disk_io_mb': disk_mb
+                                'name': pinfo['name'][:30],  # Reduced from 50 to 30
+                                'username': username[:15],  # Further reduced to 15
+                                'cpu_percent': round(cpu_percent, 1),  # 1 decimal
+                                'memory_mb': memory_mb,  # Already rounded
+                                'memory_percent': round(rss / self.total_memory * 100, 1),  # Direct calculation
+                                'disk_io_mb': disk_mb  # Already rounded
                             })
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                         pass
                 
+                # Clean up cache for processes that no longer exist
+                current_pids = {p['pid'] for p in processes}
+                # Remove dead PIDs from cache
+                for pid in list(self.process_cache.keys()):
+                    if pid not in current_pids:
+                        del self.process_cache[pid]
+                
                 processes.sort(key=lambda x: x['memory_mb'], reverse=True)
-                self.data_ready.emit(mem_info, processes[:100])  # Limit to top 100 processes
+                self.data_ready.emit(mem_info, processes)  # Show all processes
             except Exception as e:
                 print(f"Error fetching data: {e}")
         
@@ -754,6 +816,13 @@ class BrowserDialog(QDialog):
         if WEBENGINE_AVAILABLE:
             # Create web view
             self.browser = QWebEngineView()
+            
+            # Disable sandbox if running as root
+            if (hasattr(os, 'geteuid') and os.geteuid() == 0) or (os.name == 'nt' and is_windows_admin()):
+                # Running with elevated privileges - disable sandbox for security
+                settings = self.browser.settings()
+                settings.setAttribute(QWebEngineSettings.WebAttribute.LocalContentCanAccessRemoteUrls, True)
+            
             self.browser.setUrl(QUrl(url))
             layout.addWidget(self.browser)
         else:
@@ -1050,13 +1119,20 @@ class TaskManagerGUI(QMainWindow):
         self.gamepad_input_block_timer = None  # Timer for unblocking input
         if GAMEPAD_AVAILABLE:
             try:
+                # Initialize pygame for joystick support
                 pygame.init()
                 pygame.joystick.init()
+                
+                # Enable joystick events
+                pygame.event.set_allowed([pygame.JOYAXISMOTION, pygame.JOYBUTTONDOWN, 
+                                         pygame.JOYBUTTONUP, pygame.JOYHATMOTION])
+                
                 if pygame.joystick.get_count() > 0:
                     self.gamepad = pygame.joystick.Joystick(0)
                     self.gamepad.init()
                     self.gamepad_name = self.gamepad.get_name()
                     print(f"Gamepad connected: {self.gamepad_name}")
+                    print(f"Gamepad details: {self.gamepad.get_numaxes()} axes, {self.gamepad.get_numbuttons()} buttons, {self.gamepad.get_numhats()} hats")
             except Exception as e:
                 print(f"Gamepad initialization failed: {e}")
         
@@ -1069,10 +1145,10 @@ class TaskManagerGUI(QMainWindow):
             self.gamepad_timer.timeout.connect(self.process_gamepad_input)
             self.gamepad_timer.start(100)  # Poll gamepad every 100ms
         
-        # Timer for auto-refresh - faster updates
+        # Timer for auto-refresh
         self.timer = QTimer()
         self.timer.timeout.connect(self.request_data_update)
-        self.timer.start(500)  # Update every 500ms for snappier feel
+        self.timer.start(1000)  # Update every 1 second for better efficiency
         
         # Request initial data
         self.request_data_update()
@@ -1177,6 +1253,9 @@ class TaskManagerGUI(QMainWindow):
         self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(['PID', 'User', 'Process Name', 'CPU (%)', 'RAM (MB)', 'RAM (%)', 'Disk I/O (MB)'])
         
+        # Install event filter to catch key presses
+        self.table.installEventFilter(self)
+        
         # Enable right-click context menu
         self.table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self.show_context_menu)
@@ -1244,6 +1323,7 @@ class TaskManagerGUI(QMainWindow):
         self.hide_system_checkbox.setMaximumWidth(170)
         self.hide_system_checkbox.setFixedHeight(self.gpu_driver_label.sizeHint().height())
         self.hide_system_checkbox.setContentsMargins(0, 0, 0, 0)
+        self.hide_system_checkbox.installEventFilter(self)
         system_info_layout.addSpacing(20)
         system_info_layout.addWidget(self.hide_system_checkbox, 0, Qt.AlignLeft)
         
@@ -1254,6 +1334,7 @@ class TaskManagerGUI(QMainWindow):
         self.hide_inaccessible_checkbox.setMaximumWidth(200)
         self.hide_inaccessible_checkbox.setFixedHeight(self.gpu_driver_label.sizeHint().height())
         self.hide_inaccessible_checkbox.setContentsMargins(0, 0, 0, 0)
+        self.hide_inaccessible_checkbox.installEventFilter(self)
         system_info_layout.addSpacing(20)
         system_info_layout.addWidget(self.hide_inaccessible_checkbox, 0, Qt.AlignLeft)
         system_info_layout.addStretch()
@@ -1272,7 +1353,8 @@ class TaskManagerGUI(QMainWindow):
 
         # Status bar with controller label (clickable)
         self.controller_label = ClickableLabel('')
-        self.controller_label.setStyleSheet("QLabel { color: blue; text-decoration: underline; cursor: pointer; }")
+        self.controller_label.setStyleSheet("QLabel { color: blue; text-decoration: underline; }")
+        self.controller_label.setCursor(Qt.PointingHandCursor)
         self.controller_label.parent_callback = self.open_controller_test
         self.statusBar().addPermanentWidget(self.controller_label)
         self.statusBar().showMessage('Loading...')
@@ -1318,8 +1400,9 @@ class TaskManagerGUI(QMainWindow):
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
     
     def run_with_sudo(self):
-        """Restart the application with sudo privileges"""
+        """Restart the application with sudo privileges and close current window"""
         script_path = os.path.abspath(__file__)
+        my_pid = os.getpid()
 
         # Windows elevation path
         if os.name == 'nt':
@@ -1327,17 +1410,16 @@ class TaskManagerGUI(QMainWindow):
                 QMessageBox.information(self, "Info", "Already running with Administrator privileges!")
                 return
             try:
-                self.sudo_button.setEnabled(False)
                 ps_cmd = [
                     'powershell', '-NoProfile', '-Command',
-                    f'Start-Process -FilePath "{sys.executable}" -ArgumentList "\"{script_path}\"" -Verb RunAs'
+                    f'Start-Process -FilePath "{sys.executable}" -ArgumentList "\"{script_path}\",--elevated-from,{my_pid}" -Verb RunAs'
                 ]
                 subprocess.Popen(ps_cmd)
-                self.statusBar().showMessage('Launched elevated instance; current window will remain open.')
+                self.statusBar().showMessage('Launching elevated instance...')
+                # Start checking for elevated process
+                QTimer.singleShot(1000, lambda: self.check_elevated_started(my_pid))
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to request elevation: {str(e)}")
-            finally:
-                self.sudo_button.setEnabled(True)
             return
 
         # POSIX sudo path
@@ -1346,13 +1428,48 @@ class TaskManagerGUI(QMainWindow):
             return
 
         try:
-            self.sudo_button.setEnabled(False)
-            subprocess.Popen(['sudo', sys.executable, script_path])
-            self.statusBar().showMessage('Sudo instance launched; current window will remain open.')
+            subprocess.Popen(['sudo', sys.executable, script_path, '--elevated-from', str(my_pid)])
+            self.statusBar().showMessage('Launching sudo instance...')
+            # Start checking for elevated process
+            QTimer.singleShot(1000, lambda: self.check_elevated_started(my_pid))
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Failed to run with sudo: {str(e)}")
-        finally:
-            self.sudo_button.setEnabled(True)
+    
+    def check_elevated_started(self, original_pid, attempts=0):
+        """Check if elevated instance has started and close this window"""
+        try:
+            # Look for task_manager processes running with elevated privileges
+            script_name = os.path.basename(__file__)
+            python_name = os.path.basename(sys.executable)
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'username']):
+                try:
+                    cmdline = proc.info.get('cmdline', [])
+                    pid = proc.info['pid']
+                    name = proc.info.get('name', '')
+                    username = proc.info.get('username', '')
+                    
+                    # Check if this is a Python process running our script
+                    if python_name in name and cmdline and any(script_name in str(cmd) for cmd in cmdline):
+                        # Check if it's a different process with elevated privileges
+                        if pid != original_pid:
+                            # On POSIX, check if running as root
+                            if hasattr(os, 'geteuid'):
+                                if username in ['root', 'SYSTEM']:
+                                    QTimer.singleShot(200, lambda: QApplication.quit())
+                                    return
+                            else:
+                                # On Windows, just check if it's a different instance
+                                QTimer.singleShot(200, lambda: QApplication.quit())
+                                return
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+                
+        except Exception as e:
+            pass
+        
+        if attempts < 20:  # Check for up to 10 seconds
+            QTimer.singleShot(500, lambda: self.check_elevated_started(original_pid, attempts + 1))
 
     def on_hide_system_changed(self, state):
         """Handle hide system processes checkbox state change"""
@@ -2086,24 +2203,29 @@ class TaskManagerGUI(QMainWindow):
         
         # Block input if flag is set
         if hasattr(self, 'gamepad_input_blocked') and self.gamepad_input_blocked:
-            print("Gamepad input blocked, skipping...")
             return
         
         try:
+            # Process all pygame events to update joystick state
+            for event in pygame.event.get():
+                pass  # Just process events, don't need to handle them
+            
+            # Also pump events to ensure state is updated
             pygame.event.pump()
             
             # Handle menu navigation if a menu is active
             if self.active_menu and self.active_menu.isVisible():
-                print("Menu is active and visible")
                 self.process_menu_navigation()
                 return
-            elif self.active_menu:
-                print(f"Menu exists but not visible: {self.active_menu.isVisible()}")
             
             # D-pad / Left stick for navigation with continuous input
             hat = self.gamepad.get_hat(0) if self.gamepad.get_numhats() > 0 else (0, 0)
             axis_x = self.gamepad.get_axis(0) if self.gamepad.get_numaxes() > 0 else 0
             axis_y = self.gamepad.get_axis(1) if self.gamepad.get_numaxes() > 1 else 0
+            
+            # Trigger axes for fast scrolling (LT = axis 2, RT = axis 5 on Xbox controllers)
+            trigger_left = self.gamepad.get_axis(2) if self.gamepad.get_numaxes() > 2 else -1
+            trigger_right = self.gamepad.get_axis(5) if self.gamepad.get_numaxes() > 5 else -1
             
             # Check if axis moved significantly from last position
             # Invert axis_y: negative values mean up, positive means down
@@ -2232,6 +2354,43 @@ class TaskManagerGUI(QMainWindow):
                         self.gamepad_repeat_counter = self.gamepad_repeat_delay - 1  # Fast repeat
                 
                 self.gamepad_repeat_counter += 1
+            
+            # Trigger axes for fast continuous scrolling (LT/RT)
+            # Xbox controllers: triggers range from -1.0 (not pressed) to 1.0 (fully pressed)
+            if self.gamepad_focus_mode == 'table':
+                # Left trigger (LT) - scroll up fast (axis 2)
+                # Convert trigger range: -1.0 to 1.0 becomes 0.0 to 1.0
+                lt_value = (trigger_left + 1.0) / 2.0
+                if lt_value > 0.3:
+                    if not hasattr(self, 'trigger_left_counter'):
+                        self.trigger_left_counter = 0
+                    
+                    if self.trigger_left_counter == 0 or self.trigger_left_counter >= 2:
+                        current_row = self.table.currentRow()
+                        new_row = max(0, current_row - 10)
+                        self.table.setCurrentCell(new_row, 0)
+                        if self.trigger_left_counter >= 2:
+                            self.trigger_left_counter = 0
+                    self.trigger_left_counter += 1
+                else:
+                    self.trigger_left_counter = 0
+                
+                # Right trigger (RT) - scroll down fast (axis 5)
+                # Convert trigger range: -1.0 to 1.0 becomes 0.0 to 1.0
+                rt_value = (trigger_right + 1.0) / 2.0
+                if rt_value > 0.3:
+                    if not hasattr(self, 'trigger_right_counter'):
+                        self.trigger_right_counter = 0
+                    
+                    if self.trigger_right_counter == 0 or self.trigger_right_counter >= 2:
+                        current_row = self.table.currentRow()
+                        new_row = min(self.table.rowCount() - 1, current_row + 10)
+                        self.table.setCurrentCell(new_row, 0)
+                        if self.trigger_right_counter >= 2:
+                            self.trigger_right_counter = 0
+                    self.trigger_right_counter += 1
+                else:
+                    self.trigger_right_counter = 0
             
             # Button handling with state tracking
             for button_id in range(min(10, self.gamepad.get_numbuttons())):
@@ -2363,10 +2522,214 @@ class TaskManagerGUI(QMainWindow):
             return
         super().moveEvent(event)
     
+    def eventFilter(self, source, event):
+        """Filter events to catch key presses on the table and focus changes on checkboxes"""
+        # Handle checkbox focus out events
+        if (hasattr(self, 'hide_system_checkbox') and hasattr(self, 'hide_inaccessible_checkbox') and
+            source in [self.hide_system_checkbox, self.hide_inaccessible_checkbox]):
+            if event.type() == QEvent.FocusOut:
+                source.setProperty('gamepadFocus', False)
+                source.style().unpolish(source)
+                source.style().polish(source)
+                return False
+            elif event.type() == QEvent.FocusIn:
+                # Clear other checkbox when this one gets focus
+                if source == self.hide_system_checkbox:
+                    self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                    self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                    self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                else:
+                    self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                    self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                    self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                return False
+        
+        if hasattr(self, 'table') and source == self.table and event.type() == QEvent.KeyPress:
+            key = event.key()
+            
+            # Handle Home, End, and Delete keys
+            if key == Qt.Key_Home:
+                if self.table.rowCount() > 0:
+                    self.table.setCurrentCell(0, 0)
+                return True
+            elif key == Qt.Key_End:
+                if self.table.rowCount() > 0:
+                    self.table.setCurrentCell(self.table.rowCount() - 1, 0)
+                return True
+            elif key == Qt.Key_Delete:
+                selected_items = self.table.selectedItems()
+                if selected_items:
+                    selected_pids = {}
+                    for item in selected_items:
+                        row = item.row()
+                        pid_item = self.table.item(row, 0)
+                        name_item = self.table.item(row, 2)
+                        if pid_item and name_item:
+                            try:
+                                pid = int(pid_item.text())
+                                name = name_item.text()
+                                selected_pids[pid] = name
+                            except ValueError:
+                                pass
+                    if selected_pids:
+                        self.kill_processes(selected_pids)
+                return True
+        
+        return super().eventFilter(source, event)
+    
     def keyPressEvent(self, event: QKeyEvent):
-        """Handle keyboard events - focus search on alphanumeric key press"""
+        """Handle keyboard events - focus search on alphanumeric key press and navigation"""
         key = event.key()
         text = event.text()
+        
+        # Arrow key navigation with wraparound (Page Up/Down, Home, End, Delete handled by eventFilter)
+        if key == Qt.Key_Up:
+            if self.table.hasFocus():
+                current_row = self.table.currentRow()
+                if current_row > 0:
+                    self.table.setCurrentCell(current_row - 1, 0)
+                else:
+                    # At top of table, move to search box
+                    self.table.clearSelection()
+                    # Clear any checkbox highlights
+                    self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                    self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                    self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                    self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                    self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                    self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                    self.search_input.setFocus()
+            elif self.search_input.hasFocus():
+                # From search, go to hide_inaccessible
+                # Clear hide_system highlight
+                self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                # Set hide_inaccessible highlight
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', True)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.setFocus()
+            elif self.hide_inaccessible_checkbox.hasFocus():
+                # From hide_inaccessible, go to hide_system
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                self.hide_system_checkbox.setProperty('gamepadFocus', True)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                self.hide_system_checkbox.setFocus()
+            elif self.hide_system_checkbox.hasFocus():
+                # From hide_system, wrap to last process
+                self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                # Also clear hide_inaccessible in case it was highlighted
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                last_row = self.table.rowCount() - 1
+                if last_row >= 0:
+                    self.table.setCurrentCell(last_row, 0)
+                    self.table.setFocus()
+            event.accept()
+            return
+        elif key == Qt.Key_Down:
+            if self.table.hasFocus():
+                current_row = self.table.currentRow()
+                if current_row < self.table.rowCount() - 1:
+                    self.table.setCurrentCell(current_row + 1, 0)
+                else:
+                    # At bottom of table, move to hide_system
+                    self.table.clearSelection()
+                    # Clear hide_inaccessible highlight
+                    self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                    self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                    self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                    # Set hide_system highlight
+                    self.hide_system_checkbox.setProperty('gamepadFocus', True)
+                    self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                    self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                    self.hide_system_checkbox.setFocus()
+            elif self.hide_system_checkbox.hasFocus():
+                # From hide_system, go to hide_inaccessible
+                self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', True)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.setFocus()
+            elif self.hide_inaccessible_checkbox.hasFocus():
+                # From hide_inaccessible, go to search
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                # Also clear hide_system in case it was highlighted
+                self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                self.search_input.setFocus()
+            elif self.search_input.hasFocus():
+                # From search, wrap to first process
+                # Clear any checkbox highlights
+                self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                if self.table.rowCount() > 0:
+                    self.table.setCurrentCell(0, 0)
+                    self.table.setFocus()
+            event.accept()
+            return
+        elif key == Qt.Key_Left:
+            # Navigate left between checkboxes
+            if self.hide_inaccessible_checkbox.hasFocus():
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', False)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                self.hide_system_checkbox.setProperty('gamepadFocus', True)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                self.hide_system_checkbox.setFocus()
+            event.accept()
+            return
+        elif key == Qt.Key_Right:
+            # Navigate right between checkboxes
+            if self.hide_system_checkbox.hasFocus():
+                self.hide_system_checkbox.setProperty('gamepadFocus', False)
+                self.hide_system_checkbox.style().unpolish(self.hide_system_checkbox)
+                self.hide_system_checkbox.style().polish(self.hide_system_checkbox)
+                self.hide_inaccessible_checkbox.setProperty('gamepadFocus', True)
+                self.hide_inaccessible_checkbox.style().unpolish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.style().polish(self.hide_inaccessible_checkbox)
+                self.hide_inaccessible_checkbox.setFocus()
+            event.accept()
+            return
+        elif key == Qt.Key_PageUp:
+            current_row = self.table.currentRow()
+            new_row = max(0, current_row - 10)
+            self.table.setCurrentCell(new_row, 0)
+            event.accept()
+            return
+        elif key == Qt.Key_PageDown:
+            current_row = self.table.currentRow()
+            new_row = min(self.table.rowCount() - 1, current_row + 10)
+            self.table.setCurrentCell(new_row, 0)
+            event.accept()
+            return
+        elif key == Qt.Key_Space:
+            # Space to toggle checkboxes
+            if self.hide_system_checkbox.hasFocus():
+                self.hide_system_checkbox.setChecked(not self.hide_system_checkbox.isChecked())
+                event.accept()
+                return
+            elif self.hide_inaccessible_checkbox.hasFocus():
+                self.hide_inaccessible_checkbox.setChecked(not self.hide_inaccessible_checkbox.isChecked())
+                event.accept()
+                return
         
         # If gamepad is active and on a checkbox, don't intercept keys
         if hasattr(self, 'gamepad_focus_mode') and self.gamepad_focus_mode in ['hide_system', 'hide_inaccessible']:
@@ -2437,34 +2800,57 @@ class TaskManagerGUI(QMainWindow):
         # Pre-allocate all rows at once for speed
         self.table.setRowCount(len(processes))
         
-        # Color cache for performance
-        color_high = QColor(255, 200, 0, 50)
-        color_med = QColor(255, 200, 0, 30)
-        color_none = QColor(255, 255, 255, 0)
+        # Use cached color objects
+        if not hasattr(self, '_color_cache'):
+            self._color_cache = {
+                'high': QBrush(QColor(255, 200, 0, 50)),
+                'med': QBrush(QColor(255, 200, 0, 30)),
+                'none': QBrush(QColor(255, 255, 255, 0))
+            }
+        color_high = self._color_cache['high']
+        color_med = self._color_cache['med']
+        color_none = self._color_cache['none']
         
-        # Batch insert all items
+        # Batch insert all items with optimized formatting
+        non_editable_flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        str_func = str  # Cache built-in for faster access
         for row, proc in enumerate(processes):
-            pid_item = QTableWidgetItem(str(proc['pid']))
+            # Use optimized string formatting
+            pid_item = QTableWidgetItem(str_func(proc['pid']))
             user_item = QTableWidgetItem(proc.get('username', 'unknown'))
             name_item = QTableWidgetItem(proc['name'])
             cpu_value = max(0.01, proc.get('cpu_percent', 0.0))
-            cpu_item = QTableWidgetItem(f"{cpu_value:.2f}")
-            ram_item = QTableWidgetItem(f"{proc['memory_mb']:.2f}")
-            percent_item = QTableWidgetItem(f"{proc['memory_percent']:.2f}")
-            disk_item = QTableWidgetItem(f"{proc.get('disk_io_mb', 0.0):.2f}")
+            cpu_item = QTableWidgetItem(f"{cpu_value:.1f}")  # Reduced precision
+            ram_item = QTableWidgetItem(f"{proc['memory_mb']:.1f}")
+            percent_item = QTableWidgetItem(f"{proc['memory_percent']:.1f}")
+            disk_item = QTableWidgetItem(f"{proc.get('disk_io_mb', 0.0):.1f}")
             
-            # Set all items non-editable at once
-            for item in [pid_item, user_item, name_item, cpu_item, ram_item, percent_item, disk_item]:
-                item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            # Set flags more efficiently
+            pid_item.setFlags(non_editable_flags)
+            user_item.setFlags(non_editable_flags)
+            name_item.setFlags(non_editable_flags)
+            cpu_item.setFlags(non_editable_flags)
+            ram_item.setFlags(non_editable_flags)
+            percent_item.setFlags(non_editable_flags)
+            disk_item.setFlags(non_editable_flags)
             user_item.setTextAlignment(Qt.AlignCenter)
             
-            # Color code rows based on memory usage
+            # Select color based on memory usage
             if proc['memory_percent'] > 10:
                 color = color_high
             elif proc['memory_percent'] > 5:
                 color = color_med
             else:
                 color = color_none
+            
+            # Apply color to items before setting them
+            pid_item.setBackground(color)
+            user_item.setBackground(color)
+            name_item.setBackground(color)
+            cpu_item.setBackground(color)
+            ram_item.setBackground(color)
+            percent_item.setBackground(color)
+            disk_item.setBackground(color)
             
             # Set items in table
             self.table.setItem(row, 0, pid_item)
@@ -2474,10 +2860,6 @@ class TaskManagerGUI(QMainWindow):
             self.table.setItem(row, 4, ram_item)
             self.table.setItem(row, 5, percent_item)
             self.table.setItem(row, 6, disk_item)
-            
-            # Apply color
-            for col in range(7):
-                self.table.item(row, col).setBackground(color)
         
         # Re-enable updates
         self.table.setUpdatesEnabled(True)
@@ -2515,6 +2897,12 @@ def main():
     if not os.environ.get('DISPLAY'):
         print("Warning: No display found. Setting DISPLAY to :0")
         os.environ['DISPLAY'] = ':0'
+    
+    # Add --no-sandbox flag for QtWebEngine when running as root
+    if (hasattr(os, 'geteuid') and os.geteuid() == 0) or (os.name == 'nt' and is_windows_admin()):
+        if '--no-sandbox' not in sys.argv:
+            sys.argv.append('--no-sandbox')
+            print("Running as root/admin: Added --no-sandbox flag for QtWebEngine")
     
     try:
         app = QApplication(sys.argv)
