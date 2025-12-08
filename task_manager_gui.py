@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QTableWidget, QTableWidgetItem, QLabel, QProgressBar, QHeaderView, QMenu, QMessageBox, QPushButton,
     QDialog, QRadioButton, QButtonGroup, QCheckBox, QSizePolicy, QLineEdit, QTextEdit
 )
-from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject, QPoint, QRect, QEvent, QUrl
+from PyQt5.QtCore import QTimer, Qt, pyqtSignal, QObject, QPoint, QRect, QEvent, QUrl, QThread
 from PyQt5.QtGui import QFont, QColor, QBrush, QKeyEvent
 try:
     from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEngineSettings
@@ -35,8 +35,14 @@ except ImportError:
     WEBENGINE_AVAILABLE = False
 from datetime import datetime
 
-# Config file path
-CONFIG_FILE = os.path.expanduser('~/.task_manager_config.json')
+# Config file path (use APPDATA on Windows, dotfile on Unix-like systems)
+if os.name == 'nt':
+    _appdata = os.getenv('APPDATA') or os.path.expanduser('~')
+    CONFIG_FILE = os.path.join(_appdata, 'task_manager_config.json')
+else:
+    CONFIG_FILE = os.path.expanduser('~/.task_manager_config.json')
+
+# (No hard cap on processes; iterate all available processes)
 
 
 class ClickableLabel(QLabel):
@@ -57,245 +63,12 @@ def load_theme():
         if os.path.exists(CONFIG_FILE):
             with open(CONFIG_FILE, 'r') as f:
                 config = json.load(f)
-                # return saved theme if present
                 if 'theme' in config:
                     return config.get('theme', 'light')
     except Exception as e:
         print(f"Error loading theme: {e}")
-    # No saved theme -> detect system preference
-    try:
-        system_theme = detect_system_theme()
-        if system_theme in ('dark', 'light'):
-            return system_theme
-    except Exception:
-        pass
+    # Fallback: return light theme if no saved config
     return 'light'
-
-
-def detect_system_theme():
-    """Detect the system's theme preference and return 'dark' or 'light'.
-
-    Attempts (in order):
-    - GNOME `gsettings get org.gnome.desktop.interface color-scheme`
-    - GNOME `gsettings get org.gnome.desktop.interface gtk-theme`
-    - Environment hints (XDG_CURRENT_DESKTOP)
-    Falls back to 'light'.
-    """
-    # Try GNOME color-scheme (GNOME 42+)
-    try:
-        out = subprocess.run([
-            'gsettings', 'get', 'org.gnome.desktop.interface', 'color-scheme'
-        ], capture_output=True, text=True)
-        if out.returncode == 0:
-            val = out.stdout.strip().strip("'\" ")
-            if 'dark' in val.lower():
-                return 'dark'
-            if 'light' in val.lower():
-                return 'light'
-    except Exception:
-        pass
-
-    # Try GTK theme name
-    try:
-        out = subprocess.run([
-            'gsettings', 'get', 'org.gnome.desktop.interface', 'gtk-theme'
-        ], capture_output=True, text=True)
-        if out.returncode == 0:
-            val = out.stdout.strip().strip("'\" ")
-            if 'dark' in val.lower():
-                return 'dark'
-            # some themes include 'Light' or not; default to light
-            return 'light'
-    except Exception:
-        pass
-
-    # Fallback: check desktop env hints
-    desktop = os.environ.get('XDG_CURRENT_DESKTOP', '') or os.environ.get('DESKTOP_SESSION', '')
-    desktop = desktop.lower()
-    if 'gnome' in desktop or 'unity' in desktop:
-        # assume light unless GTK says dark
-        return 'light'
-    if 'kde' in desktop or 'plasma' in desktop:
-        # KDE users often choose dark themes; attempt to read QT setting could be complex
-        return 'light'
-
-    return 'light'
-
-
-def detect_gpu_info():
-    """Detect GPU name and driver version.
-
-    Tries (in order):
-    - `nvidia-smi --query-gpu=name,driver_version`
-    - `/proc/driver/nvidia/version`
-    - `glxinfo` (OpenGL renderer/version)
-    - `lspci -nnk` (VGA/3D controller and kernel driver)
-    Returns a dict: { 'name': str, 'driver': str }
-    """
-    info = {'name': 'Unknown', 'driver': 'Unknown'}
-
-    try:
-        # NVIDIA users - nvidia-smi provides clear info (works on Windows and Linux if in PATH)
-        if shutil.which('nvidia-smi'):
-            out = subprocess.run(
-                ['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'],
-                capture_output=True, text=True
-            )
-            if out.returncode == 0 and out.stdout.strip():
-                line = out.stdout.strip().splitlines()[0]
-                parts = [p.strip() for p in line.split(',')]
-                name = parts[0] if parts else 'NVIDIA GPU'
-                driver = parts[1] if len(parts) > 1 else 'Unknown'
-                return {'name': name, 'driver': driver}
-    except Exception:
-        pass
-
-    # Windows-specific fallback via PowerShell WMI
-    if os.name == 'nt':
-        try:
-            ps_cmd = [
-                'powershell', '-NoProfile', '-Command',
-                'Get-CimInstance Win32_VideoController | Select-Object -First 1 Name,DriverVersion | '
-                'ForEach-Object { "$($_.Name)|$($_.DriverVersion)" }'
-            ]
-            out = subprocess.run(ps_cmd, capture_output=True, text=True)
-            if out.returncode == 0 and out.stdout.strip():
-                line = out.stdout.strip().splitlines()[0]
-                if '|' in line:
-                    name, driver = [part.strip() or 'Unknown' for part in line.split('|', 1)]
-                    return {'name': name, 'driver': driver}
-        except Exception:
-            pass
-
-    try:
-        # Check for /proc driver info (NVIDIA)
-        if os.path.exists('/proc/driver/nvidia/version'):
-            with open('/proc/driver/nvidia/version', 'r') as f:
-                txt = f.read().strip()
-                # Try to find a version-like token
-                import re
-                m = re.search(r"(\d+\.\d+(?:\.\d+)*)", txt)
-                ver = m.group(1) if m else txt.splitlines()[0]
-                return {'name': 'NVIDIA GPU', 'driver': ver}
-    except Exception:
-        pass
-
-    try:
-        # glxinfo (OpenGL renderer and version)
-        if shutil.which('glxinfo'):
-            out = subprocess.run(['glxinfo'], capture_output=True, text=True)
-            if out.returncode == 0 and out.stdout:
-                renderer = ''
-                version = ''
-                for line in out.stdout.splitlines():
-                    if 'OpenGL renderer string' in line:
-                        renderer = line.split(':', 1)[1].strip()
-                    if 'OpenGL version string' in line:
-                        version = line.split(':', 1)[1].strip()
-                if renderer:
-                    return {'name': renderer, 'driver': version or 'Unknown'}
-    except Exception:
-        pass
-
-    try:
-        # lspci fallback: try to find VGA/3D controller and kernel driver
-        if shutil.which('lspci'):
-            out = subprocess.run(['lspci', '-nnk'], capture_output=True, text=True)
-            if out.returncode == 0 and out.stdout:
-                lines = out.stdout.splitlines()
-                for i, line in enumerate(lines):
-                    low = line.lower()
-                    if 'vga compatible controller' in low or '3d controller' in low or 'display controller' in low:
-                        # device name after the first ':'
-                        name = line.split(':', 1)[1].strip()
-                        driver = 'Unknown'
-                        for j in range(i + 1, min(i + 6, len(lines))):
-                            if 'kernel driver in use:' in lines[j].lower():
-                                driver = lines[j].split(':', 1)[1].strip()
-                                break
-                        return {'name': name, 'driver': driver}
-    except Exception:
-        pass
-
-    return info
-
-
-def detect_cpu_name():
-    """Detect the installed CPU model name."""
-    # Windows: Read from registry
-    if os.name == 'nt':
-        try:
-            import winreg
-            key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"HARDWARE\DESCRIPTION\System\CentralProcessor\0")
-            cpu_name = winreg.QueryValueEx(key, "ProcessorNameString")[0]
-            winreg.CloseKey(key)
-            return cpu_name.strip()
-        except Exception:
-            pass
-    
-    # Linux: Read from /proc/cpuinfo
-    try:
-        if os.path.exists('/proc/cpuinfo'):
-            with open('/proc/cpuinfo', 'r') as f:
-                for line in f:
-                    if 'model name' in line:
-                        return line.split(':', 1)[1].strip()
-    except Exception:
-        pass
-
-    # Fallback to platform module
-    try:
-        import platform
-        name = platform.processor() or platform.machine()
-        if name and name not in ['GenuineIntel', 'AuthenticAMD']:
-            return name
-    except Exception:
-        pass
-
-    return 'Unknown CPU'
-
-
-def detect_os_name():
-    """Detect the installed operating system name."""
-    try:
-        import platform
-        system = platform.system() or 'Unknown OS'
-        
-        # For Linux, try to get the distribution name
-        if system == 'Linux':
-            try:
-                # Try freedesktop.org standard
-                if os.path.exists('/etc/os-release'):
-                    with open('/etc/os-release', 'r') as f:
-                        for line in f:
-                            if line.startswith('PRETTY_NAME='):
-                                distro_name = line.split('=', 1)[1].strip().strip('"')
-                                return distro_name
-                
-                # Fallback to platform.freedesktop_os_release (Python 3.10+)
-                try:
-                    import platform
-                    if hasattr(platform, 'freedesktop_os_release'):
-                        os_info = platform.freedesktop_os_release()
-                        return os_info.get('PRETTY_NAME', os_info.get('NAME', 'Linux'))
-                except:
-                    pass
-            except Exception:
-                pass
-            
-            # If we couldn't get distro name, show Linux with kernel version
-            release = platform.release() or ''
-            if release:
-                return f"Linux {release}"
-            return "Linux"
-        
-        # For other systems (Windows, macOS, etc.)
-        release = platform.release() or ''
-        if release:
-            return f"{system} {release}"
-        return system
-    except Exception:
-        return 'Unknown OS'
 
 
 def is_windows_admin() -> bool:
@@ -306,6 +79,147 @@ def is_windows_admin() -> bool:
         return ctypes.windll.shell32.IsUserAnAdmin() != 0
     except Exception:
         return False
+
+
+def detect_system_theme() -> str:
+    """Return 'dark' or 'light' based on OS preference. Minimal implementation."""
+    try:
+        if os.name == 'nt':
+            try:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize")
+                val, _ = winreg.QueryValueEx(key, 'AppsUseLightTheme')
+                winreg.CloseKey(key)
+                return 'light' if val == 1 else 'dark'
+            except Exception:
+                return 'light'
+        else:
+            # Default to light on non-Windows
+            return 'light'
+    except Exception:
+        return 'light'
+
+
+def detect_gpu_info() -> dict:
+    """Try to detect GPU name and driver version. Returns dict with 'name' and 'driver'."""
+    info = {'name': 'Unknown', 'driver': 'Unknown'}
+    try:
+        # Try nvidia-smi for NVIDIA GPUs
+        out = shutil.which('nvidia-smi')
+        if out:
+            proc = subprocess.run(['nvidia-smi', '--query-gpu=name,driver_version', '--format=csv,noheader'], capture_output=True, text=True)
+            if proc.returncode == 0 and proc.stdout.strip():
+                parts = [p.strip() for p in proc.stdout.strip().split(',')]
+                if parts:
+                    info['name'] = parts[0]
+                    if len(parts) > 1:
+                        info['driver'] = parts[1]
+                    return info
+    except Exception:
+        pass
+
+    # Fallback Windows WMI via PowerShell
+    if os.name == 'nt':
+        try:
+            ps_cmd = [
+                'powershell', '-NoProfile', '-Command',
+                'Get-CimInstance Win32_VideoController | Select-Object -First 1 Name,DriverVersion | ForEach-Object { "$($_.Name)|$($_.DriverVersion)" }'
+            ]
+            out = subprocess.run(ps_cmd, capture_output=True, text=True)
+            if out.returncode == 0 and out.stdout.strip():
+                line = out.stdout.strip().splitlines()[0]
+                if '|' in line:
+                    name, driver = [part.strip() or 'Unknown' for part in line.split('|', 1)]
+                    info['name'] = name
+                    info['driver'] = driver
+                    return info
+        except Exception:
+            pass
+
+    return info
+
+
+def detect_os_name() -> str:
+    """Return a friendly OS name."""
+    try:
+        import platform
+        # On Windows, prefer ProductName from the registry for friendly names
+        if os.name == 'nt':
+            try:
+                import winreg
+                key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion")
+                product_name, _ = winreg.QueryValueEx(key, 'ProductName')
+                build_str, _ = winreg.QueryValueEx(key, 'CurrentBuildNumber')
+                try:
+                    ubr, _ = winreg.QueryValueEx(key, 'UBR')
+                except Exception:
+                    ubr = None
+                winreg.CloseKey(key)
+                # Normalize Windows 11 detection by build number >= 22000
+                try:
+                    build_num = int(build_str)
+                except Exception:
+                    build_num = 0
+                if 'Windows 11' in product_name or build_num >= 22000:
+                    base = 'Windows 11'
+                else:
+                    base = product_name
+                if ubr:
+                    return f"{base} (Build {build_str}, UBR {ubr})"
+                return f"{base} (Build {build_str})"
+            except Exception:
+                # Fallback to platform APIs
+                try:
+                    ver = platform.version()
+                    return f"Windows {ver}"
+                except Exception:
+                    return 'Windows'
+
+        # Non-Windows: use platform system + release
+        name = platform.system()
+        rel = platform.release()
+        return f"{name} {rel}"
+    except Exception:
+        return 'Unknown'
+
+
+def detect_cpu_name() -> str:
+    """Return a short CPU name if available."""
+    try:
+        import platform
+        # On Windows, platform.processor() often returns vendor strings like 'GenuineIntel'.
+        # Prefer using PowerShell/WMI to get the friendly processor name if available.
+        if os.name == 'nt':
+            try:
+                ps_cmd = [
+                    'powershell', '-NoProfile', '-Command',
+                    'Get-CimInstance Win32_Processor | Select-Object -First 1 -ExpandProperty Name'
+                ]
+                out = subprocess.run(ps_cmd, capture_output=True, text=True)
+                if out.returncode == 0 and out.stdout.strip():
+                    name = out.stdout.strip().splitlines()[0].strip()
+                    if name:
+                        return name
+            except Exception:
+                pass
+
+        # Fallback to platform.processor()
+        cpu = platform.processor() or ''
+        if cpu and cpu.lower() not in ('', 'genuineintel', 'authenticamd'):
+            return cpu
+
+        # Try Linux /proc
+        if os.path.exists('/proc/cpuinfo'):
+            try:
+                with open('/proc/cpuinfo', 'r', encoding='utf-8', errors='ignore') as f:
+                    for line in f:
+                        if 'model name' in line.lower():
+                            return line.split(':', 1)[1].strip()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return 'Unknown'
 
 
 def save_theme(theme_name):
@@ -374,92 +288,133 @@ def save_hide_inaccessible_processes(hide_inaccessible: bool):
         print(f"Error saving hide_inaccessible_processes: {e}")
 
 
-class DataFetcher(QObject):
-    """Worker thread to fetch system data without blocking UI"""
-    __slots__ = ['process_cache', 'total_memory']
+class DataFetcher(QThread):
+    """Persistent background thread that polls system data at a configurable interval.
+
+    Emits `data_ready` with (mem_info, processes).
+    """
     data_ready = pyqtSignal(dict, list)
-    
-    def __init__(self):
+
+    def __init__(self, interval_sec=4.0):
         super().__init__()
+        self.interval = float(interval_sec)
         self.process_cache = {}
-        self.total_memory = psutil.virtual_memory().total  # Cache total memory
-    
-    def fetch_data(self):
-        """Fetch memory and process data in background thread"""
-        def _fetch():
+        self.total_memory = psutil.virtual_memory().total
+        self._stop_event = threading.Event()
+        self._immediate_event = threading.Event()
+        # CPU sampling: sample every N cycles
+        self._cpu_sample_rate = 4
+        self._cpu_sample_counter = 0
+        # Whether we've performed an initial cpu_percent() warm-up pass
+        self._cpu_initialized = False
+        # Disk IO sampling threshold (MB)
+        self._disk_io_threshold_mb = 50
+
+    def trigger_fetch(self):
+        """Trigger an immediate fetch outside the regular interval."""
+        self._immediate_event.set()
+
+    def stop(self):
+        self._stop_event.set()
+        self._immediate_event.set()
+
+    def run(self):
+        while not self._stop_event.is_set():
             try:
                 mem = psutil.virtual_memory()
-                gb_divisor = 1073741824  # 1024**3 cached as constant
+                gb_divisor = 1073741824
                 mem_info = {
                     'total': round(mem.total / gb_divisor, 2),
                     'used': round(mem.used / gb_divisor, 2),
                     'available': round(mem.available / gb_divisor, 2),
                     'percent': round(mem.percent, 1)
                 }
-                
+
                 processes = []
+                do_cpu_sample = (self._cpu_sample_counter == 0)
+
                 for proc in psutil.process_iter(['pid', 'name', 'memory_info', 'username']):
                     try:
-                            # Use oneshot() for better performance on Windows
                         with proc.oneshot():
                             pid = proc.pid
                             pinfo = proc.as_dict(attrs=['pid', 'name', 'memory_info', 'username'])
                             rss = pinfo['memory_info'].rss
-                            memory_mb = round(rss / 1048576, 1)  # Pre-calculated divisor
-                            # Get CPU usage with caching for efficiency
+                            memory_mb = round(rss / 1048576, 1)
+
                             cpu_percent = 0.0
                             try:
-                                # Use cached value if available, otherwise calculate
-                                if pid in self.process_cache:
-                                    cpu_percent = proc.cpu_percent(interval=0)
+                                if do_cpu_sample:
+                                    # Use interval=None to get non-blocking percent compared to last call.
+                                    # On the very first sampling pass we must "warm up" the counters
+                                    # by calling cpu_percent once (it will return 0.0). Subsequent
+                                    # calls with interval=None return meaningful percentages.
+                                    if not self._cpu_initialized:
+                                        proc.cpu_percent(interval=None)
+                                        self.process_cache[pid] = 0.0
+                                    else:
+                                        cpu_percent = proc.cpu_percent(interval=None)
+                                        # store last seen value in cache for use between sample cycles
+                                        self.process_cache[pid] = float(cpu_percent)
                                 else:
-                                    # First call for this process - initialize
-                                    proc.cpu_percent(interval=0)
-                                    self.process_cache[pid] = True
-                                    cpu_percent = 0.0
+                                    cpu_percent = float(self.process_cache.get(pid, 0.0))
                             except (psutil.AccessDenied, psutil.NoSuchProcess):
                                 cpu_percent = 0.0
-                            
-                            # Get disk I/O - skip for low-activity processes to save CPU
+
                             disk_mb = 0.0
-                            if memory_mb > 10:  # Only check disk I/O for processes using >10MB RAM
+                            if memory_mb > self._disk_io_threshold_mb:
                                 try:
                                     io = proc.io_counters()
                                     disk_mb = round((io.read_bytes + io.write_bytes) / 1048576, 1)
                                 except (psutil.AccessDenied, psutil.NoSuchProcess, AttributeError):
                                     pass
-                            
-                            # Handle username - Windows may return None or DOMAIN\User format
+
                             username = pinfo.get('username') or 'unknown'
                             if '\\' in username:
-                                username = username.rpartition('\\')[2]  # Faster than split
-                            
+                                username = username.rpartition('\\')[2]
+
                             processes.append({
                                 'pid': pinfo['pid'],
-                                'name': pinfo['name'][:30],  # Reduced from 50 to 30
-                                'username': username[:15],  # Further reduced to 15
-                                'cpu_percent': round(cpu_percent, 1),  # 1 decimal
-                                'memory_mb': memory_mb,  # Already rounded
-                                'memory_percent': round(rss / self.total_memory * 100, 1),  # Direct calculation
-                                'disk_io_mb': disk_mb  # Already rounded
+                                'name': (pinfo['name'] or '')[:30],
+                                'username': username[:15],
+                                'cpu_percent': round(cpu_percent, 1),
+                                'memory_mb': memory_mb,
+                                'memory_percent': round(rss / self.total_memory * 100, 1),
+                                'disk_io_mb': disk_mb
                             })
                     except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
                         pass
-                
-                # Clean up cache for processes that no longer exist
+
+                # Clean up process cache
                 current_pids = {p['pid'] for p in processes}
-                # Remove dead PIDs from cache
                 for pid in list(self.process_cache.keys()):
                     if pid not in current_pids:
                         del self.process_cache[pid]
-                
+
+                # Mark CPU initialized once we've completed one warm-up sampling pass
+                if do_cpu_sample and not self._cpu_initialized:
+                    self._cpu_initialized = True
+
                 processes.sort(key=lambda x: x['memory_mb'], reverse=True)
-                self.data_ready.emit(mem_info, processes)  # Show all processes
+                # Emit data to UI thread
+                self.data_ready.emit(mem_info, processes)
             except Exception as e:
-                print(f"Error fetching data: {e}")
-        
-        # Run fetch in background thread to not block UI
-        threading.Thread(target=_fetch, daemon=True).start()
+                print(f"Error in DataFetcher run loop: {e}")
+            finally:
+                # advance sampling counter
+                try:
+                    self._cpu_sample_counter = (self._cpu_sample_counter + 1) % self._cpu_sample_rate
+                except Exception:
+                    self._cpu_sample_counter = 0
+
+            # Wait for interval or immediate trigger or stop
+            if self._stop_event.is_set():
+                break
+            signaled = self._immediate_event.wait(self.interval)
+            if signaled:
+                self._immediate_event.clear()
+
+
+# Removed ProcessTableModel to restore original QTableWidget implementation
 
 
 class VirtualKeyboard(QDialog):
@@ -1099,7 +1054,7 @@ class ThemeDialog(QDialog):
 class TaskManagerGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.data_fetcher = DataFetcher()
+        self.data_fetcher = DataFetcher(interval_sec=4.0)
         self.current_theme = load_theme()  # Load saved theme
         
         # Track selected rows
@@ -1145,15 +1100,52 @@ class TaskManagerGUI(QMainWindow):
         if self.gamepad:
             self.gamepad_timer = QTimer()
             self.gamepad_timer.timeout.connect(self.process_gamepad_input)
-            self.gamepad_timer.start(150)  # Poll gamepad every 150ms (reduced for CPU efficiency)
+            self.gamepad_timer.start(250)  # Poll gamepad every 250ms (reduced for CPU efficiency)
         
         # Timer for auto-refresh
         self.timer = QTimer()
         self.timer.timeout.connect(self.request_data_update)
-        self.timer.start(1000)  # Update every 1 second for better efficiency
+        self.timer.start(2000)  # Update every 2 seconds to reduce CPU usage ~50%
         
-        # Request initial data
-        self.request_data_update()
+        # Cached latest fetched data to allow fast local filtering (search/hide)
+        self._cached_processes = []
+        self._last_mem_info = None
+        # Track last rendered rows for diff-based table updates
+        self._last_rendered = []
+        # Debounce timer for search input to make typing feel responsive
+        self._search_debounce_timer = QTimer()
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(200)  # ms
+        self._search_debounce_timer.timeout.connect(self._apply_search_filter)
+        # UI coalescing timer: batch rapid data_ready calls into a single UI update
+        self._ui_update_timer = QTimer()
+        self._ui_update_timer.setSingleShot(True)
+        self._ui_update_timer.setInterval(20)  # ms; small delay to coalesce bursts (reduced for snappier UI)
+        self._ui_update_timer.timeout.connect(self._flush_ui_update)
+        # Pending render parameters (set by _apply_search_filter)
+        self._pending_render_mem_info = None
+        self._pending_render_processes = None
+        self._pending_total_processes = 0
+        # User scrolling detection: postpone rendering while user scrolls
+        self._user_scrolling = False
+        self._scroll_inactive_timer = QTimer()
+        self._scroll_inactive_timer.setSingleShot(True)
+        self._scroll_inactive_timer.setInterval(300)  # ms of idle before considered stopped
+        self._scroll_inactive_timer.timeout.connect(self._on_scroll_stopped)
+        # Background filler: populate off-screen rows progressively to keep UI responsive
+        self._bg_fill_timer = QTimer()
+        self._bg_fill_timer.setSingleShot(False)
+        self._bg_fill_timer.setInterval(80)  # ms between background batches
+        self._bg_fill_timer.timeout.connect(self._bg_fill_step)
+        self._pending_offscreen_fill = []  # list of (row, proc)
+        # Window move optimization: pause heavy UI updates while the window is being moved
+        self._window_moving = False
+        self._bg_fill_was_active = False
+        self._ui_update_was_active = False
+        self._move_idle_timer = QTimer()
+        self._move_idle_timer.setSingleShot(True)
+        self._move_idle_timer.setInterval(300)  # ms of idle after move before resuming updates
+        self._move_idle_timer.timeout.connect(self._on_move_stopped)
     
     def initUI(self):
         """Initialize the user interface"""
@@ -1215,8 +1207,8 @@ class TaskManagerGUI(QMainWindow):
         bar_layout.addWidget(self.progress_bar, 1)
         bar_layout.addWidget(self.progress_label)
         
-        # Sudo button
-        self.sudo_button = QPushButton('Run as Sudo')
+        # Run as Admin button (Windows) / Run as Sudo (POSIX)
+        self.sudo_button = QPushButton('Run as Admin')
         self.sudo_button.clicked.connect(self.run_with_sudo)
         self.sudo_button.setMaximumWidth(120)
         bar_layout.addWidget(self.sudo_button)
@@ -1277,6 +1269,16 @@ class TaskManagerGUI(QMainWindow):
         self.table.setSelectionMode(QTableWidget.ExtendedSelection)  # Ctrl/Shift for multi-select
         self.table.verticalScrollBar().setSingleStep(3)  # Faster scrolling
         self.table.verticalScrollBar().setPageStep(10)
+        # Improve rendering performance for uniform rows
+        try:
+            self.table.setUniformRowHeights(True)
+        except Exception:
+            pass
+        # Connect scrollbar activity to detect user scrolling
+        try:
+            self.table.verticalScrollBar().valueChanged.connect(self._on_user_scrolled)
+        except Exception:
+            pass
         self.table.setStyleSheet("""
             QTableWidget {
                 alternate-background-color: #f0f0f0;
@@ -1397,6 +1399,10 @@ class TaskManagerGUI(QMainWindow):
         
         # Connect data fetcher signal
         self.data_fetcher.data_ready.connect(self.on_data_ready)
+        # Start persistent fetcher thread
+        self.data_fetcher.start()
+        # Trigger initial fetch
+        self.request_data_update()
         
         # Connect table selection signal
         self.table.itemSelectionChanged.connect(self.on_selection_changed)
@@ -1406,19 +1412,19 @@ class TaskManagerGUI(QMainWindow):
         script_path = os.path.abspath(__file__)
         my_pid = os.getpid()
 
-        # Windows elevation path
+        # Windows elevation path: use ShellExecute with the 'runas' verb to request elevation
         if os.name == 'nt':
             if is_windows_admin():
                 QMessageBox.information(self, "Info", "Already running with Administrator privileges!")
                 return
             try:
-                ps_cmd = [
-                    'powershell', '-NoProfile', '-Command',
-                    f'Start-Process -FilePath "{sys.executable}" -ArgumentList "\"{script_path}\",--elevated-from,{my_pid}" -Verb RunAs'
-                ]
-                subprocess.Popen(ps_cmd)
+                # Build argument string to pass the script path and an indicator that it was elevated
+                arg_str = f'"{script_path}" --elevated-from {my_pid}'
+                # Use ShellExecuteW to request elevation (returns >32 on success)
+                ret = ctypes.windll.shell32.ShellExecuteW(None, "runas", sys.executable, arg_str, None, 1)
+                if int(ret) <= 32:
+                    raise OSError(f"ShellExecuteW failed with code {ret}")
                 self.statusBar().showMessage('Launching elevated instance...')
-                # Start checking for elevated process
                 QTimer.singleShot(1000, lambda: self.check_elevated_started(my_pid))
             except Exception as e:
                 QMessageBox.warning(self, "Error", f"Failed to request elevation: {str(e)}")
@@ -1476,16 +1482,66 @@ class TaskManagerGUI(QMainWindow):
     def on_hide_system_changed(self, state):
         """Handle hide system processes checkbox state change"""
         save_hide_system_processes(self.hide_system_checkbox.isChecked())
-        self.request_data_update()
+        # If we have cached data, just re-apply filters locally for responsiveness
+        if self._last_mem_info is not None:
+            self._apply_search_filter()
+        else:
+            self.request_data_update()
     
     def on_hide_inaccessible_changed(self, state):
         """Handle hide inaccessible processes checkbox state change"""
         save_hide_inaccessible_processes(self.hide_inaccessible_checkbox.isChecked())
-        self.request_data_update()
+        # If we have cached data, just re-apply filters locally for responsiveness
+        if self._last_mem_info is not None:
+            self._apply_search_filter()
+        else:
+            self.request_data_update()
     
     def on_search_changed(self, text):
         """Handle search input text change"""
-        self.request_data_update()
+        # Debounce and, if we have cached data, filter locally for snappy typing
+        if self._last_mem_info is None:
+            # No data yet: request initial fetch
+            self.request_data_update()
+            return
+
+        # Restart debounce timer
+        self._search_debounce_timer.start()
+
+    def _apply_search_filter(self):
+        """Apply current search and hide filters to cached processes and update UI."""
+        if self._last_mem_info is None:
+            return
+
+        # Start from the full cached process list (as received from fetcher)
+        processes = list(self._cached_processes)
+
+        total_processes = len(processes)
+
+        # Apply system-process filter if enabled
+        if self.hide_system_checkbox.isChecked():
+            processes = [p for p in processes if not self.is_system_process(p)]
+
+        # Apply inaccessible-process filter if enabled
+        if self.hide_inaccessible_checkbox.isChecked():
+            processes = [p for p in processes if not self.is_inaccessible_process(p)]
+
+        # Apply search filter if search text is entered
+        search_text = self.search_input.text().strip().lower()
+        if search_text:
+            processes = [p for p in processes if search_text in p.get('name', '').lower()]
+
+        # Schedule the (filtered) processes to be rendered by the UI coalescer
+        self._pending_render_mem_info = self._last_mem_info
+        self._pending_render_processes = processes
+        self._pending_total_processes = total_processes
+        # Restart the UI update timer (coalesce multiple rapid updates)
+        try:
+            if self._ui_update_timer.isActive():
+                self._ui_update_timer.stop()
+        except Exception:
+            pass
+        self._ui_update_timer.start()
     
     @staticmethod
     def is_inaccessible_process(proc: dict) -> bool:
@@ -2517,9 +2573,48 @@ class TaskManagerGUI(QMainWindow):
     
     def moveEvent(self, event):
         """Block window movement when browser dialog is open"""
+        # If a blocking dialog is open, ignore moves
         if hasattr(self, 'browser_dialog_open') and self.browser_dialog_open:
             event.ignore()
             return
+
+        # Mark window as moving and pause heavy UI updates to avoid stutter
+        try:
+            self._window_moving = True
+
+            # Remember and stop background filler to avoid spikes
+            try:
+                self._bg_fill_was_active = self._bg_fill_timer.isActive()
+                if self._bg_fill_timer.isActive():
+                    self._bg_fill_timer.stop()
+            except Exception:
+                self._bg_fill_was_active = False
+
+            # Pause UI coalescer
+            try:
+                self._ui_update_was_active = self._ui_update_timer.isActive()
+                if self._ui_update_timer.isActive():
+                    self._ui_update_timer.stop()
+            except Exception:
+                self._ui_update_was_active = False
+
+            # Temporarily disable widget updates to reduce repaint overhead
+            try:
+                self.setUpdatesEnabled(False)
+                self.table.setUpdatesEnabled(False)
+            except Exception:
+                pass
+
+            # Restart idle timer to detect when move stops
+            try:
+                if self._move_idle_timer.isActive():
+                    self._move_idle_timer.stop()
+                self._move_idle_timer.start()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         super().moveEvent(event)
     
     def eventFilter(self, source, event):
@@ -2746,48 +2841,88 @@ class TaskManagerGUI(QMainWindow):
             self.table.setFocus()
         else:
             super().keyPressEvent(event)
+
+    def closeEvent(self, event):
+        """Stop background threads cleanly on window close."""
+        try:
+            if hasattr(self, 'data_fetcher') and self.data_fetcher.isRunning():
+                self.data_fetcher.stop()
+                self.data_fetcher.wait(1000)
+        except Exception:
+            pass
+        super().closeEvent(event)
     
     def request_data_update(self):
         """Request data update in worker thread"""
-        self.data_fetcher.fetch_data()
+        # Wake the persistent worker to fetch immediately
+        if hasattr(self, 'data_fetcher'):
+            self.data_fetcher.trigger_fetch()
     
     def on_data_ready(self, mem_info, processes):
-        """Handle data received from worker thread"""
+        """Handle data received from worker thread by caching and applying local filters."""
+        # Cache full set of processes and last mem info for local filtering
+        self._cached_processes = processes
+        self._last_mem_info = mem_info
+
+        # If change is significant and user is not scrolling, render immediately for snappy UX
+        try:
+            immediate = False
+            if not getattr(self, '_user_scrolling', False):
+                if self._is_significant_change(mem_info, processes):
+                    immediate = True
+        except Exception:
+            immediate = False
+
+        # Apply current search/hide filters locally for immediate responsiveness
+        self._apply_search_filter()
+
+        if immediate:
+            # Flush pending UI update right away
+            try:
+                if self._ui_update_timer.isActive():
+                    self._ui_update_timer.stop()
+            except Exception:
+                pass
+            QTimer.singleShot(0, self._flush_ui_update)
+
+    def _render_process_list(self, mem_info, processes, total_processes):
+        """Render the provided (already filtered) processes list into the table."""
         # Save current scroll position
         scroll_value = self.table.verticalScrollBar().value()
+        prev_rows = getattr(self, '_last_rendered', []) or []
+        full_reload = len(prev_rows) != len(processes)
 
-        # Track total before filtering
-        total_processes = len(processes)
+        # Temporarily disable sorting to avoid expensive resort on every update
+        try:
+            sorting_was_enabled = self.table.isSortingEnabled()
+        except Exception:
+            sorting_was_enabled = False
+        try:
+            self.table.setSortingEnabled(False)
+        except Exception:
+            pass
 
-        # Apply system-process filter if enabled
-        if self.hide_system_checkbox.isChecked():
-            processes = [p for p in processes if not self.is_system_process(p)]
-        
-        # Apply inaccessible-process filter if enabled
-        if self.hide_inaccessible_checkbox.isChecked():
-            processes = [p for p in processes if not self.is_inaccessible_process(p)]
-        
-        # Apply search filter if search text is entered
-        search_text = self.search_input.text().strip().lower()
-        if search_text:
-            processes = [p for p in processes if search_text in p.get('name', '').lower()]
-        
         # Disable updates and selection signals during refresh
         self.table.setUpdatesEnabled(False)
-        self.table.itemSelectionChanged.disconnect(self.on_selection_changed)
-        self.table.setRowCount(0)  # Clear faster than individual updates
-        
+        try:
+            self.table.itemSelectionChanged.disconnect(self.on_selection_changed)
+        except Exception:
+            pass
+        if full_reload:
+            self.table.setRowCount(0)
+            self.table.setRowCount(len(processes))
+
         # Update memory info - only if changed to reduce flickering
         self.total_ram_label.setText(f"{mem_info['total']:.2f} GB")
         self.used_ram_label.setText(f"{mem_info['used']:.2f} GB")
         self.available_ram_label.setText(f"{mem_info['available']:.2f} GB")
-        
+
         # Update progress bar
         percent = int(mem_info['percent'])
         if self.progress_bar.value() != percent:
             self.progress_bar.setValue(percent)
         self.progress_label.setText(f"{mem_info['percent']:.1f}%")
-        
+
         # Color code the progress bar - cache colors
         if mem_info['percent'] < 50:
             style = "QProgressBar::chunk { background-color: #27ae60; }"
@@ -2796,10 +2931,7 @@ class TaskManagerGUI(QMainWindow):
         else:
             style = "QProgressBar::chunk { background-color: #e74c3c; }"
         self.progress_bar.setStyleSheet(style)
-        
-        # Pre-allocate all rows at once for speed
-        self.table.setRowCount(len(processes))
-        
+
         # Use cached color objects
         if not hasattr(self, '_color_cache'):
             self._color_cache = {
@@ -2810,31 +2942,80 @@ class TaskManagerGUI(QMainWindow):
         color_high = self._color_cache['high']
         color_med = self._color_cache['med']
         color_none = self._color_cache['none']
-        
-        # Batch insert all items with optimized formatting
+
+        # Batch insert/update items with optimized formatting and diffing
         non_editable_flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
         str_func = str  # Cache built-in for faster access
+
+        # Compute visible row range to minimize work during updates
+        try:
+            viewport_height = self.table.viewport().height()
+            top_row = self.table.rowAt(0)
+            if top_row < 0:
+                top_row = 0
+            bottom_row = self.table.rowAt(viewport_height - 1)
+            if bottom_row < 0:
+                # estimate visible rows from default row height
+                try:
+                    rh = self.table.rowHeight(0) if self.table.rowCount() > 0 else self.table.verticalHeader().defaultSectionSize()
+                    rows_visible = max(1, int(viewport_height / max(1, rh)))
+                except Exception:
+                    rows_visible = 20
+                bottom_row = min(len(processes) - 1, top_row + rows_visible)
+        except Exception:
+            top_row = 0
+            bottom_row = min(len(processes) - 1, 20)
+
         for row, proc in enumerate(processes):
-            # Use optimized string formatting
-            pid_item = QTableWidgetItem(str_func(proc['pid']))
-            user_item = QTableWidgetItem(proc.get('username', 'unknown'))
-            name_item = QTableWidgetItem(proc['name'])
-            cpu_value = max(0.01, proc.get('cpu_percent', 0.0))
-            cpu_item = QTableWidgetItem(f"{cpu_value:.1f}")  # Reduced precision
-            ram_item = QTableWidgetItem(f"{proc['memory_mb']:.1f}")
-            percent_item = QTableWidgetItem(f"{proc['memory_percent']:.1f}")
-            disk_item = QTableWidgetItem(f"{proc.get('disk_io_mb', 0.0):.1f}")
-            
-            # Set flags more efficiently
+            # Skip work for rows outside the visible window to reduce UI churn
+            if row < top_row or row > bottom_row:
+                # still keep prev comparison and bookkeeping, but avoid creating items
+                prev = prev_rows[row] if (not full_reload and row < len(prev_rows)) else None
+                if (not full_reload) and prev and prev == proc:
+                    continue
+                # don't create items for off-screen rows
+                continue
+            prev = prev_rows[row] if (not full_reload and row < len(prev_rows)) else None
+            if (not full_reload) and prev and prev == proc:
+                # No change for this visible row; skip updates
+                continue
+            prev = prev_rows[row] if (not full_reload and row < len(prev_rows)) else None
+            if (not full_reload) and prev and prev == proc:
+                # No change for this row; skip updates
+                continue
+
+            # Always create fresh QTableWidgetItem objects to avoid ownership issues
+            pid_item = QTableWidgetItem()
             pid_item.setFlags(non_editable_flags)
+
+            user_item = QTableWidgetItem()
             user_item.setFlags(non_editable_flags)
-            name_item.setFlags(non_editable_flags)
-            cpu_item.setFlags(non_editable_flags)
-            ram_item.setFlags(non_editable_flags)
-            percent_item.setFlags(non_editable_flags)
-            disk_item.setFlags(non_editable_flags)
             user_item.setTextAlignment(Qt.AlignCenter)
-            
+
+            name_item = QTableWidgetItem()
+            name_item.setFlags(non_editable_flags)
+
+            cpu_item = QTableWidgetItem()
+            cpu_item.setFlags(non_editable_flags)
+
+            ram_item = QTableWidgetItem()
+            ram_item.setFlags(non_editable_flags)
+
+            percent_item = QTableWidgetItem()
+            percent_item.setFlags(non_editable_flags)
+
+            disk_item = QTableWidgetItem()
+            disk_item.setFlags(non_editable_flags)
+
+            cpu_value = max(0.01, proc.get('cpu_percent', 0.0))
+            pid_item.setText(str_func(proc['pid']))
+            user_item.setText(proc.get('username', 'unknown'))
+            name_item.setText(proc['name'])
+            cpu_item.setText(f"{cpu_value:.1f}")
+            ram_item.setText(f"{proc['memory_mb']:.1f}")
+            percent_item.setText(f"{proc['memory_percent']:.1f}")
+            disk_item.setText(f"{proc.get('disk_io_mb', 0.0):.1f}")
+
             # Select color based on memory usage
             if proc['memory_percent'] > 10:
                 color = color_high
@@ -2842,8 +3023,7 @@ class TaskManagerGUI(QMainWindow):
                 color = color_med
             else:
                 color = color_none
-            
-            # Apply color to items before setting them (only if not default)
+
             if color is not color_none:
                 pid_item.setBackground(color)
                 user_item.setBackground(color)
@@ -2852,19 +3032,84 @@ class TaskManagerGUI(QMainWindow):
                 ram_item.setBackground(color)
                 percent_item.setBackground(color)
                 disk_item.setBackground(color)
-            
-            # Set items in table
-            self.table.setItem(row, 0, pid_item)
-            self.table.setItem(row, 1, user_item)
-            self.table.setItem(row, 2, name_item)
-            self.table.setItem(row, 3, cpu_item)
-            self.table.setItem(row, 4, ram_item)
-            self.table.setItem(row, 5, percent_item)
-            self.table.setItem(row, 6, disk_item)
-        
+            else:
+                # Clear background if previously set
+                pid_item.setBackground(color_none)
+                user_item.setBackground(color_none)
+                name_item.setBackground(color_none)
+                cpu_item.setBackground(color_none)
+                ram_item.setBackground(color_none)
+                percent_item.setBackground(color_none)
+                disk_item.setBackground(color_none)
+
+            # Assign items for visible rows immediately
+            if not getattr(self, '_user_scrolling', False):
+                self.table.setItem(row, 0, pid_item)
+                self.table.setItem(row, 1, user_item)
+                self.table.setItem(row, 2, name_item)
+                self.table.setItem(row, 3, cpu_item)
+                self.table.setItem(row, 4, ram_item)
+                self.table.setItem(row, 5, percent_item)
+                self.table.setItem(row, 6, disk_item)
+            else:
+                # If currently scrolling, still queue visible-row items to ensure they appear
+                # (this rarely happens because we skip when scrolling, but keep safe)
+                try:
+                    self._pending_offscreen_fill.append((row, pid_item, user_item, name_item, cpu_item, ram_item, percent_item, disk_item))
+                except Exception:
+                    pass
+
         # Re-enable updates
         self.table.setUpdatesEnabled(True)
+
+        # Prepare background fill for off-screen rows (populate remaining rows in batches)
+        try:
+            # Build pending fill list for rows not currently filled
+            pending = []
+            for r in range(self.table.rowCount()):
+                if self.table.item(r, 0) is None and r < len(processes):
+                    p = processes[r]
+                    pending.append((r, p))
+            self._pending_offscreen_fill = pending
+            if self._pending_offscreen_fill:
+                if not self._bg_fill_timer.isActive():
+                    self._bg_fill_timer.start()
+            else:
+                try:
+                    if self._bg_fill_timer.isActive():
+                        self._bg_fill_timer.stop()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # Restore previous sorting state
+        try:
+            self.table.setSortingEnabled(sorting_was_enabled)
+        except Exception:
+            pass
         
+        # Restore selections if they still exist (without scrolling to them)
+        if not getattr(self, '_user_scrolling', False):
+            if self.selected_pid:
+                self.table.blockSignals(True)
+                for row in range(self.table.rowCount()):
+                    pid_item = self.table.item(row, 0)
+                    if pid_item:
+                        try:
+                            pid = int(pid_item.text())
+                            if pid in self.selected_pid:
+                                self.table.selectRow(row)
+                        except ValueError:
+                            pass
+                self.table.blockSignals(False)
+            
+            # Restore scroll position only when not actively scrolling
+            try:
+                self.table.verticalScrollBar().setValue(scroll_value)
+            except Exception:
+                pass
+
         # Restore selections if they still exist (without scrolling to them)
         if self.selected_pid:
             self.table.blockSignals(True)
@@ -2878,19 +3123,277 @@ class TaskManagerGUI(QMainWindow):
                     except ValueError:
                         pass
             self.table.blockSignals(False)
-        
+
         # Restore scroll position
         self.table.verticalScrollBar().setValue(scroll_value)
-        
+
         # Reconnect selection signal
-        self.table.itemSelectionChanged.connect(self.on_selection_changed)
-        
+        try:
+            self.table.itemSelectionChanged.connect(self.on_selection_changed)
+        except Exception:
+            pass
+
+        # Store a shallow copy of current rows for diffing on next refresh
+        try:
+            self._last_rendered = [dict(p) for p in processes]
+        except Exception:
+            self._last_rendered = processes
+
         # Update status bar with both counts
         current_time = datetime.now().strftime('%H:%M:%S')
         if self.hide_system_checkbox.isChecked() or self.hide_inaccessible_checkbox.isChecked():
             self.statusBar().showMessage(f'Ready - Last updated: {current_time} | Showing: {len(processes)} / Total Processes: {total_processes}')
         else:
             self.statusBar().showMessage(f'Ready - Last updated: {current_time} | Total Processes: {total_processes}')
+
+    def _flush_ui_update(self):
+        """Called from the UI coalescing timer to perform a single render of pending data."""
+        mem_info = self._pending_render_mem_info or self._last_mem_info
+        processes = self._pending_render_processes or list(self._cached_processes)
+        total = self._pending_total_processes or len(self._cached_processes)
+        # If the user is actively scrolling, postpone intensive render until scrolling stops
+        if getattr(self, '_user_scrolling', False):
+            # re-schedule the ui update slightly later to avoid stutter
+            try:
+                if self._ui_update_timer.isActive():
+                    self._ui_update_timer.stop()
+            except Exception:
+                pass
+            # Start a slightly longer delay while scrolling
+            try:
+                # give some time for scrolling to stop before attempting a render
+                self._ui_update_timer.start(250)
+            except Exception:
+                pass
+            return
+
+        try:
+            self._render_process_list(mem_info, processes, total)
+        finally:
+            # Clear pending values
+            self._pending_render_mem_info = None
+            self._pending_render_processes = None
+            self._pending_total_processes = 0
+
+    def _is_significant_change(self, mem_info, processes) -> bool:
+        """Return True if the incoming data is meaningfully different from last rendered.
+
+        Heuristics used:
+        - Memory percent changed by >= 0.5%
+        - Top-3 PIDs changed (different set)
+        - Total process count changed by > 3
+        """
+        try:
+            # Mem percent change
+            last_mem = getattr(self, '_last_mem_info', None)
+            if last_mem:
+                try:
+                    if abs(float(mem_info.get('percent', 0.0)) - float(last_mem.get('percent', 0.0))) >= 0.5:
+                        return True
+                except Exception:
+                    pass
+
+            # Top 3 pid changes
+            last_rows = getattr(self, '_last_rendered', None)
+            try:
+                new_top = tuple(p['pid'] for p in (processes[:3] if processes else []))
+            except Exception:
+                new_top = ()
+            try:
+                old_top = tuple(p.get('pid') for p in (last_rows[:3] if last_rows else []))
+            except Exception:
+                old_top = ()
+            if new_top and old_top and set(new_top) != set(old_top):
+                return True
+
+            # Process count delta
+            if last_rows is not None and abs(len(processes) - len(last_rows)) > 3:
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _on_user_scrolled(self, value=None):
+        """Called when the user moves the vertical scrollbar; mark scrolling active and debounce stop."""
+        try:
+            self._user_scrolling = True
+            # restart inactive timer
+            if self._scroll_inactive_timer.isActive():
+                self._scroll_inactive_timer.stop()
+            self._scroll_inactive_timer.start()
+        except Exception:
+            pass
+
+    def _on_scroll_stopped(self):
+        """Called when scroll activity has paused; mark not scrolling and trigger any pending UI update."""
+        try:
+            self._user_scrolling = False
+            # If there's pending data, ensure we flush soon
+            if self._pending_render_processes is not None:
+                if self._ui_update_timer.isActive():
+                    self._ui_update_timer.stop()
+                self._ui_update_timer.start(10)
+        except Exception:
+            pass
+
+    def _on_move_stopped(self):
+        """Called when window movement has paused; resume previously paused UI updates."""
+        try:
+            self._window_moving = False
+
+            # Re-enable updates
+            try:
+                self.setUpdatesEnabled(True)
+                self.table.setUpdatesEnabled(True)
+            except Exception:
+                pass
+
+            # Resume background filler if it was previously active or there is pending work
+            try:
+                if getattr(self, '_bg_fill_was_active', False) or getattr(self, '_pending_offscreen_fill', None):
+                    if not self._bg_fill_timer.isActive() and getattr(self, '_pending_offscreen_fill', None):
+                        self._bg_fill_timer.start()
+            except Exception:
+                pass
+
+            # If there was a UI update pending or was active before move, flush now
+            try:
+                if getattr(self, '_ui_update_was_active', False) or self._pending_render_processes is not None:
+                    # Schedule an immediate flush to update the UI
+                    QTimer.singleShot(10, self._flush_ui_update)
+            except Exception:
+                pass
+
+            # Reset remembered flags
+            try:
+                self._bg_fill_was_active = False
+                self._ui_update_was_active = False
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"_on_move_stopped error: {e}")
+
+    def _bg_fill_step(self):
+        """Fill a small batch of pending off-screen rows to avoid large single-frame updates.
+
+        The pending entries may be either:
+        - (row, QTableWidgetItem, QTableWidgetItem, ... ) tuples produced while scrolling,
+        - or (row, proc_dict) tuples produced after a render to progressively populate off-screen rows.
+        """
+        try:
+            if not hasattr(self, '_pending_offscreen_fill') or not self._pending_offscreen_fill:
+                try:
+                    if self._bg_fill_timer.isActive():
+                        self._bg_fill_timer.stop()
+                except Exception:
+                    pass
+                return
+
+            # Number of rows to fill per tick - tuneable
+            batch_size = 8
+
+            non_editable_flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+
+            # Ensure color cache exists
+            if not hasattr(self, '_color_cache'):
+                self._color_cache = {
+                    'high': QBrush(QColor(255, 200, 0, 50)),
+                    'med': QBrush(QColor(255, 200, 0, 30)),
+                    'none': QBrush(QColor(255, 255, 255, 0))
+                }
+
+            filled = 0
+            for _ in range(batch_size):
+                if not self._pending_offscreen_fill:
+                    break
+                entry = self._pending_offscreen_fill.pop(0)
+                # Two possible shapes: (row, pid_item, user_item, name_item, cpu_item, ram_item, percent_item, disk_item)
+                # or (row, proc_dict)
+                try:
+                    if len(entry) >= 8 and isinstance(entry[1], QTableWidgetItem):
+                        row = entry[0]
+                        items = entry[1:]
+                        # Ensure row exists
+                        if row >= self.table.rowCount():
+                            continue
+                        for col, itm in enumerate(items):
+                            try:
+                                self.table.setItem(row, col, itm)
+                            except Exception:
+                                pass
+                        filled += 1
+                    else:
+                        row, proc = entry
+                        if row >= self.table.rowCount():
+                            continue
+                        # Create fresh items similar to rendering path
+                        pid_item = QTableWidgetItem()
+                        pid_item.setFlags(non_editable_flags)
+                        user_item = QTableWidgetItem()
+                        user_item.setFlags(non_editable_flags)
+                        user_item.setTextAlignment(Qt.AlignCenter)
+                        name_item = QTableWidgetItem()
+                        name_item.setFlags(non_editable_flags)
+                        cpu_item = QTableWidgetItem()
+                        cpu_item.setFlags(non_editable_flags)
+                        ram_item = QTableWidgetItem()
+                        ram_item.setFlags(non_editable_flags)
+                        percent_item = QTableWidgetItem()
+                        percent_item.setFlags(non_editable_flags)
+                        disk_item = QTableWidgetItem()
+                        disk_item.setFlags(non_editable_flags)
+
+                        cpu_value = max(0.01, proc.get('cpu_percent', 0.0))
+                        pid_item.setText(str(proc.get('pid', '')))
+                        user_item.setText(proc.get('username', 'unknown'))
+                        name_item.setText(proc.get('name', ''))
+                        cpu_item.setText(f"{cpu_value:.1f}")
+                        ram_item.setText(f"{proc.get('memory_mb', 0.0):.1f}")
+                        percent_item.setText(f"{proc.get('memory_percent', 0.0):.1f}")
+                        disk_item.setText(f"{proc.get('disk_io_mb', 0.0):.1f}")
+
+                        # Color selection
+                        color = self._color_cache['none']
+                        try:
+                            if proc.get('memory_percent', 0.0) > 10:
+                                color = self._color_cache['high']
+                            elif proc.get('memory_percent', 0.0) > 5:
+                                color = self._color_cache['med']
+                        except Exception:
+                            color = self._color_cache['none']
+
+                        if color is not self._color_cache['none']:
+                            for itm in (pid_item, user_item, name_item, cpu_item, ram_item, percent_item, disk_item):
+                                itm.setBackground(color)
+                        else:
+                            for itm in (pid_item, user_item, name_item, cpu_item, ram_item, percent_item, disk_item):
+                                itm.setBackground(self._color_cache['none'])
+
+                        # Apply to table
+                        try:
+                            self.table.setItem(row, 0, pid_item)
+                            self.table.setItem(row, 1, user_item)
+                            self.table.setItem(row, 2, name_item)
+                            self.table.setItem(row, 3, cpu_item)
+                            self.table.setItem(row, 4, ram_item)
+                            self.table.setItem(row, 5, percent_item)
+                            self.table.setItem(row, 6, disk_item)
+                        except Exception:
+                            pass
+                        filled += 1
+                except Exception:
+                    # Ignore malformed entries and continue
+                    continue
+
+            # If nothing left to fill, stop timer
+            if not self._pending_offscreen_fill:
+                try:
+                    if self._bg_fill_timer.isActive():
+                        self._bg_fill_timer.stop()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"_bg_fill_step error: {e}")
 
 
 def main():
